@@ -13,7 +13,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	clientset "open-cluster-management.io/api/client/cluster/clientset/versioned"
 	clusterinformerv1 "open-cluster-management.io/api/client/cluster/informers/externalversions/cluster/v1"
@@ -38,10 +40,8 @@ type managedClusterSetController struct {
 	// clusterSetsMap caches the mappings between clusters and clustersets.
 	// With the mappings, it's easy to find out which clustersets are impacted on a
 	// change of cluster.
-	clusterSetsMap map[string]string
-
-	// mapLock protects the read/write of clusterSetsMap
-	mapLock sync.RWMutex
+	clusterSetsMap map[string]sets.String
+	mapLock        sync.Mutex
 }
 
 // NewManagedClusterSetController creates a new managed cluster set controller
@@ -50,68 +50,60 @@ func NewManagedClusterSetController(
 	clusterInformer clusterinformerv1.ManagedClusterInformer,
 	clusterSetInformer clusterinformerv1beta1.ManagedClusterSetInformer,
 	recorder events.Recorder) factory.Controller {
+	syncCtx := factory.NewSyncContext("managed-cluster-set-controller", recorder)
+	enqueue := func(clustersets ...string) {
+		for _, clusterset := range clustersets {
+			syncCtx.Queue().Add(clusterset)
+		}
+	}
 	c := &managedClusterSetController{
 		clusterClient:    clusterClient,
 		clusterLister:    clusterInformer.Lister(),
 		clusterSetLister: clusterSetInformer.Lister(),
 		eventRecorder:    recorder.WithComponentSuffix("managed-cluster-set-controller"),
-
-		clusterSetsMap: map[string]string{},
 	}
+
+	clusterInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			c.onClusterSetChange(obj, enqueue)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			c.onClusterSetChange(newObj, enqueue)
+		},
+		DeleteFunc: func(obj interface{}) {
+			var clusterName string
+			switch t := obj.(type) {
+			case *clusterv1.ManagedCluster:
+				clusterName = t.Name
+			case cache.DeletedFinalStateUnknown:
+				cluster, ok := t.Obj.(metav1.Object)
+				if !ok {
+					utilruntime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
+					return
+				}
+				clusterName = cluster.GetName()
+			default:
+				utilruntime.HandleError(fmt.Errorf("error decoding object, invalid type"))
+				return
+			}
+
+			if clusterSets, ok := c.clusterSetsMap[clusterName]; ok {
+				c.mapLock.Lock()
+				defer c.mapLock.Unlock()
+				delete(c.clusterSetsMap, clusterName)
+				enqueue(clusterSets.List()...)
+			}
+		},
+	})
+
 	return factory.New().
 		WithInformersQueueKeyFunc(func(obj runtime.Object) string {
 			accessor, _ := meta.Accessor(obj)
 			return accessor.GetName()
 		}, clusterSetInformer.Informer()).
-		// register two event handlers to cluster informer. One haneles the current parent
-		// clusterset, and the other handles the original parent clusterset. The order of
-		// the registering matters. originalClusterSetQueueKeyFunc must be called before
-		// currentClusterSetQueueKeyFunc is called, otherwise clusterSetsMap will be updated
-		// unexpectedly
-		//
-		// TODO, create a PR for library-go to accept a queue key function, which
-		// is able to produce a []string instead of string based on one object, when
-		// registering event handler. And then refactor the logic here.
-		WithInformersQueueKeyFunc(c.originalClusterSetQueueKeyFunc, clusterInformer.Informer()).
-		WithInformersQueueKeyFunc(c.currentClusterSetQueueKeyFunc, clusterInformer.Informer()).
+		WithBareInformers(clusterInformer.Informer()).
 		WithSync(c.sync).
 		ToController("ManagedClusterSetController", recorder)
-}
-
-// originalClusterSetQueueKeyFunc returns the original clusterset the cluster previously
-// belonged to.
-func (c *managedClusterSetController) originalClusterSetQueueKeyFunc(obj runtime.Object) string {
-	c.mapLock.RLock()
-	defer c.mapLock.RUnlock()
-
-	accessor, _ := meta.Accessor(obj)
-	clusterName := accessor.GetName()
-	originalClusterSetName := c.clusterSetsMap[clusterName]
-
-	var currentClusterSetName string
-	if clusterLabels := accessor.GetLabels(); clusterLabels != nil {
-		currentClusterSetName = clusterLabels[clusterSetLabel]
-	}
-
-	// return the name of clusterset it previously belonged to only if the parent clusterset
-	// is changed
-	if originalClusterSetName != currentClusterSetName {
-		return originalClusterSetName
-	}
-	return ""
-}
-
-// currentClusterSetQueueKeyFunc returns the current clusterset the cluster currently
-// belongs to.
-func (c *managedClusterSetController) currentClusterSetQueueKeyFunc(obj runtime.Object) string {
-	accessor, _ := meta.Accessor(obj)
-
-	// always return the name of clusterset it currently belongs to
-	if clusterLabels := accessor.GetLabels(); clusterLabels != nil {
-		return clusterLabels[clusterSetLabel]
-	}
-
-	return ""
 }
 
 func (c *managedClusterSetController) sync(ctx context.Context, syncCtx factory.SyncContext) error {
@@ -145,19 +137,26 @@ func (c *managedClusterSetController) sync(ctx context.Context, syncCtx factory.
 func (c *managedClusterSetController) syncClusterSet(ctx context.Context, originalClusterSet *clusterv1beta1.ManagedClusterSet) error {
 	clusterSet := originalClusterSet.DeepCopy()
 
+	labelKey, labelValue := clusterSetLabel, clusterSet.Name
+	if len(clusterSet.Spec.ExclusiveKey) != 0 {
+		labelKey = clusterSet.Spec.ExclusiveKey
+	}
+	if len(clusterSet.Spec.ExclusiveValue) != 0 {
+		labelValue = clusterSet.Spec.ExclusiveValue
+	}
+
 	// find out the containing clusters of clusterset
 	selector := labels.SelectorFromSet(labels.Set{
-		clusterSetLabel: clusterSet.Name,
+		labelKey: labelValue,
 	})
 	clusters, err := c.clusterLister.List(selector)
 	if err != nil {
 		return fmt.Errorf("failed to list ManagedClusters: %w", err)
 	}
 
-	//update the cluster-to-clusterset mappings
-	c.updateClusterSetsMap(clusterSet.Name, clusters)
-
 	// update clusterset status
+	clusterSet.Status.NumberOfSelectedClusters = int32(len(clusters))
+
 	emptyCondition := metav1.Condition{
 		Type: clusterv1beta1.ManagedClusterSetConditionEmpty,
 	}
@@ -173,7 +172,7 @@ func (c *managedClusterSetController) syncClusterSet(ctx context.Context, origin
 	meta.SetStatusCondition(&clusterSet.Status.Conditions, emptyCondition)
 
 	// skip update if cluster set status does not change
-	if reflect.DeepEqual(clusterSet.Status.Conditions, originalClusterSet.Status.Conditions) {
+	if reflect.DeepEqual(clusterSet.Status, originalClusterSet.Status) {
 		return nil
 	}
 
@@ -185,31 +184,44 @@ func (c *managedClusterSetController) syncClusterSet(ctx context.Context, origin
 	return nil
 }
 
-// updateClusterSetsMap updates the cluster-to-clusterset mappings with memebers of a
-// given cluster set
-func (c *managedClusterSetController) updateClusterSetsMap(clusterSetName string, clusters []*clusterv1.ManagedCluster) {
+func (c *managedClusterSetController) onClusterSetChange(obj interface{}, enqueue func(clustersets ...string)) {
+	cluster, ok := obj.(*clusterv1.ManagedCluster)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("error decoding object, invalid type"))
+		return
+	}
+
+	clustersets, err := c.clusterSetLister.List(labels.Everything())
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("error listing clustersets: %w", err))
+	}
+
+	currentClusterSets := sets.NewString()
+	for _, clusterset := range clustersets {
+		if isMemberOf(cluster, clusterset) {
+			currentClusterSets.Insert(clusterset.Name)
+		}
+	}
+
+	impacted := currentClusterSets
 	c.mapLock.Lock()
 	defer c.mapLock.Unlock()
+	orignialClusterSets, ok := c.clusterSetsMap[cluster.Name]
+	if ok {
+		impacted = currentClusterSets.Union(orignialClusterSets)
+	}
+	c.clusterSetsMap[cluster.Name] = currentClusterSets
+	enqueue(impacted.List()...)
+}
 
-	newMembers := sets.NewString()
-	for _, cluster := range clusters {
-		newMembers.Insert(cluster.Name)
+func isMemberOf(cluster *clusterv1.ManagedCluster, clusterSet *clusterv1beta1.ManagedClusterSet) bool {
+	key, value := clusterSetLabel, clusterSet.Name
+	if len(clusterSet.Spec.ExclusiveKey) != 0 {
+		key = clusterSet.Spec.ExclusiveKey
+	}
+	if len(clusterSet.Spec.ExclusiveValue) != 0 {
+		value = clusterSet.Spec.ExclusiveValue
 	}
 
-	originalMembers := sets.NewString()
-	for c, cs := range c.clusterSetsMap {
-		if cs != clusterSetName {
-			continue
-		}
-		originalMembers.Insert(c)
-	}
-
-	toBeAdded := newMembers.Difference(originalMembers)
-	toBeRemoved := originalMembers.Difference(newMembers)
-	for clusterName := range toBeAdded {
-		c.clusterSetsMap[clusterName] = clusterSetName
-	}
-	for clusterName := range toBeRemoved {
-		delete(c.clusterSetsMap, clusterName)
-	}
+	return cluster.Labels[key] == value
 }

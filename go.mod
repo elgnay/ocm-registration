@@ -4,6 +4,8 @@ go 1.16
 
 replace github.com/googleapis/gnostic => github.com/googleapis/gnostic v0.4.1 // ensure compatible between controller-runtime and kube-openapi
 
+replace open-cluster-management.io/api => /Users/leyan/workspaces/acm/api
+
 require (
 	github.com/onsi/ginkgo v1.14.0
 	github.com/onsi/gomega v1.10.1
