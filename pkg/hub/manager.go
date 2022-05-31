@@ -86,6 +86,12 @@ func RunControllerManager(ctx context.Context, controllerContext *controllercmd.
 		controllerContext.EventRecorder,
 	)
 
+	csrSigningController := csr.NewCSRSigningController(
+		kubeClient,
+		kubeInfomers.Certificates().V1().CertificateSigningRequests(),
+		controllerContext.EventRecorder,
+	)
+
 	leaseController := lease.NewClusterLeaseController(
 		kubeClient,
 		clusterClient,
@@ -156,6 +162,7 @@ func RunControllerManager(ctx context.Context, controllerContext *controllercmd.
 	go managedClusterController.Run(ctx, 1)
 	go taintController.Run(ctx, 1)
 	go csrController.Run(ctx, 1)
+	go csrSigningController.Run(ctx, 1)
 	go leaseController.Run(ctx, 1)
 	go rbacFinalizerController.Run(ctx, 1)
 	go managedClusterSetController.Run(ctx, 1)

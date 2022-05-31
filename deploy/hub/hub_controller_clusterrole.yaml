@@ -46,7 +46,7 @@ rules:
 - apiGroups: ["certificates.k8s.io"]
   resources: ["signers"]
   resourceNames: ["kubernetes.io/kube-apiserver-client"]
-  verbs: ["approve"]
+  verbs: ["approve", "sign"]
 # Allow hub to manage managedclustersets
 - apiGroups: ["cluster.open-cluster-management.io"]
   resources: ["managedclustersets"]
